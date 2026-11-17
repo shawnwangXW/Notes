@@ -73,6 +73,9 @@
     - [Low](#low)
   - [Practical Basel](#practical-basel)
   - [Basel Tutolrial](#basel-tutolrial)
+  - [Misc](#misc)
+  - [Node](#node)
+  - [PhasedLoopHandler](#phasedloophandler)
 
 ## Pneumatics
 
@@ -635,3 +638,28 @@ Not counted: `workshops2026/cookie_loop` (deliberately commented-out student exe
 ## [Practical Basel](https://www.stevenengelhardt.com/2023/03/08/practical-bazel-using-clang-12-c-toolchain-on-ubuntu-20.04/)
 
 ## [Basel Tutolrial](https://bazel.build/tutorials/ccp-toolchain-config)
+
+## Misc
+key function to read:
+
+void Localizer::HandleTarget
+
+There is a main function in apriltag_detector.cc running frc::vision::GpuApriltagDetector()
+
+Is there radio signal interferrence?
+
+## Node 
+A Node represents a computer or network endpoint in the AOS configuration—not a process or thread. Multiple processes and event loops can run on one node; an event loop may also run on a thread. In simulation, a Node identifies which simulated computer an event loop belongs to.
+
+
+## PhasedLoopHandler
+PhasedLoopHandler represents a periodic callback registered with an EventLoop via AddPhasedLoop(). It schedules callbacks at a steady interval and optional offset from the interval—for example, every 20 ms, aligned to a chosen phase.
+
+The callback receives the number of cycles elapsed since its previous call. If the loop runs late and misses intervals, that value can be greater than 1. The handler also lets you change the interval/offset or reschedule the loop
+
+
+## All Apps
+### apriltag_detector.cc
+get camera id, create AprilTagDetector (third_party/aos/frc/orin/gpu_apritag.cc) instance
+
+core function ApriltagDetector::HandleImage - detection tag, pose estimation (estimate_tag_pose_orthogonal_iteration) - to be continued
