@@ -1,6 +1,21 @@
 
 ## void ApriltagDetector::HandleImage
+It processes one camera frame end to end: it runs GPU AprilTag detection, filters candidates, estimates their poses, and publishes annotations and target poses. It’s defined in gpu_apriltag.cc.
 
+* Validate and prepare the image: Checks the frame format, data, and dimensions. It gets a CUDA device pointer for the image buffer, then passes both the host pointer and device pointer to gpu_detector_.Detect(...).
+* Filter detections: A candidate must exceed the configured minimum decision margin. Its four corners must also lie inside the configured pixel border; otherwise it’s rejected and its corners are annotated in red.
+* Estimate pose for candidates that pass: Builds detection information using the tag size and camera intrinsics. It records the original corners in green, undistorts them, and rejects non-converging results (annotated orange). It then estimates two possible poses and keeps the one with the lower error. The undistorted corners are annotated in pink.
+* Publish outputs: Sends the corner annotations, then serializes each accepted detection’s ID, position, orientation, and quality metrics into a target map. The map also includes the frame’s timestamp and the rejection count.
+
+This function estimates the tag’s pose relative to the camera from the image. It uses the tag’s physical size to set its model corners (±tagsize/2) in estimate_tag_pose_orthogonal_iteration.
+
+The field location is used downstream: network_tables_publisher.cc loads each fiducial’s transform from the field map into tag_transformations_. When a detection arrives, it combines that known tag-to-field transform with the estimated tag-to-camera pose to compute the camera’s field pose (HandleTargetMap).
+
+### How does it handle the case when there are more than one valid tags in the image?
+
+It processes detections one at a time in the loop. Each tag that passes the checks gets its own pose estimate; the code chooses the lower-error of the two pose solutions for that tag, not one winner across the whole image.
+
+Accepted tags are appended to results, then all are serialized into the same TargetMap as separate entries in target_poses. Their corner annotations are also collected together. Tags that fail a check are skipped and counted as rejections. 
 
 ## void GpuDetector::DecodeTags()  
 GpuDetector::DecodeTags() takes the detected quad corners and decodes them into AprilTag detections.
@@ -115,3 +130,67 @@ Step-by-Step Decomposition Process
 * 3. **Determine the Third Rotation Column:** The third column of the rotation matrix $r_3$ is calculated as the cross product of the first two orthonormal columns to ensure a right-handed coordinate system:$$r_3 = r_1 \times r_2$$This constructs the complete rotation matrix $R = \begin{bmatrix} r_1 & r_2 & r_3 \end{bmatrix}$.
 * 4. **Calculate the Translation Vector:** Recover the translation vector $T$ by scaling the third column of the decomposition product:$$T = \frac{1}{\Vert{}K^{-1} h_1\}} K^{-1} h_3$$
 * 5. **Resolve Ambiguities (Sign Selection):** Because homography decomposition typically yields up to 4 mathematical solutions for $(R, T)$ (due to sign flips), you must apply the positive depth constraint: the points observed must lie in front of the camera ($z > 0$). Test the candidate poses on at least one known point to select the physically valid solution.
+
+
+# HandleTargetMap
+
+It turns the detections from one camera frame into a robot pose on the field. It currently uses only the nearest detected tag; the TODO means it does not combine information from multiple tags.
+
+* Pick the nearest tag. It loops through target_poses, computes each tag’s translation length (sqrt(x²+y²+z²)), and keeps the smallest. If there are no detections, or the nearest is beyond FLAGS_max_distance, it returns without publishing a pose.
+* Get the camera-relative tag pose. The selected detection’s position and orientation form tag_to_camera. The tag ID selects its known field pose, tag_to_field, from the field map.
+* Compute the camera’s field pose. It inverts the detected tag pose and composes it with the known field pose. The april_to_photon rotation converts between the coordinate conventions used by the detector and field map.
+* Convert to the robot’s field pose. It uses the camera’s calibrated fixed extrinsics, derives the robot’s yaw from the resulting rotation, then publishes a 2D pose. The position is shifted by half the field dimensions to match the field’s coordinate origin.
+
+So the tag’s known physical field location enters through tag_transformations_[target_pose->id()]; the detected pose supplies where that tag appears relative to the camera.
+
+# How to combine multiple tags for a more accurate pose estimation?
+
+First convert each detection into a pose in the same frame. Don’t average the detected tags’ camera-relative translations directly: each translation is relative to a different tag.
+
+For each tag (i), use its ID to get the known field pose and combine it with that tag’s camera-relative pose, applying the coordinate-frame conversion and camera extrinsics. In this function’s convention, that follows the existing chain:
+
+```
+camera_to_field_i = tag_to_field_i * april_to_photon * tag_to_camera_i.inverse();
+
+robot_to_field_i = camera_to_field_i * camera_to_robot.inverse();
+```
+
+Then fuse the resulting robot_to_field_i estimates:
+
+* Reject outliers first—for example, estimates that disagree substantially in position or orientation with the others.
+* Average translation with a weighted mean.
+* Average rotation with a quaternion/rotation-matrix mean, not by averaging Euler angles.
+* Ideally, use each estimate’s uncertainty as its weight. Decision margin and reprojection error can help filter detections, but they aren’t automatically calibrated uncertainty estimates.
+
+A simple robust implementation could find a consensus among the per-tag robot poses, discard inconsistent estimates, then compute a weighted mean of the remaining poses. For the strongest estimate, optimize one shared robot pose against the observed corners of all tags together; that avoids separately solving each tag and then averaging. This would replace the current nearest-tag-only selection in HandleTargetMap.
+
+## How to optimize one shared robot pose against the observed corners of all tags together?
+Use one candidate robot pose to predict the image location of every observed tag corner, then adjust that pose to minimize the total pixel error.
+
+Let ($T_{A\leftarrow B}$) mean “transform coordinates from frame B into frame A.” For each detected tag $(i)$, you know its field pose $(T_{F\leftarrow T_i})$ and its four observed image corners $(u_{ij})$. A candidate robot pose $(T_{F\leftarrow R})$, together with the camera extrinsics, determines where each known tag corner should appear:
+
+$$
+p_C =
+T_{C\leftarrow R}
+(T_{F\leftarrow R})^{-1}
+T_{F\leftarrow T_i}
+q_{ij}
+$$
+
+Here ($q_{ij}$) is one of the tag’s known 3D corners, at $((\pm L/2,\pm L/2,0))$. Project (p_C) through the camera model to get a predicted pixel (\hat u_{ij}), and minimize the reprojection error across all tags and corners:
+
+$$
+\min_{T_{F\leftarrow R}}
+\sum_{i,j}
+\rho!\left(\left|\hat u_{ij}-u_{ij}\right|^2\right)
+$$
+
+Use a robust loss such as Huber so one bad detection does not dominate. For a robot constrained to the field floor, the unknown can often be just $(x,y,\text{yaw})$; otherwise optimize a full 6-DoF pose. Keep the existing AprilTag/field-map coordinate conversion in the transform chain.
+
+There’s a data-flow gap to address: HandleTargetMap receives per-tag poses, but not the observed corners needed for reprojection. The corners are available earlier in gpu_apriltag.cc, while target_map.fbs currently has no corner fields. You could run the joint solver where the corners are available and provide it the field layout, or extend the message to carry tag IDs and corners so the solver can run where the field map and camera extrinsics are already used.
+
+Initialize the optimizer from the existing per-tag pose estimates, then verify it on recorded frames with ground-truth robot poses.
+
+
+# References
+[MultiTag Localization](https://docs.photonvision.org/en/latest/docs/apriltag-pipelines/multitag.html)
