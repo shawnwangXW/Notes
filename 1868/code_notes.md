@@ -190,7 +190,38 @@ Use a robust loss such as Huber so one bad detection does not dominate. For a ro
 There’s a data-flow gap to address: HandleTargetMap receives per-tag poses, but not the observed corners needed for reprojection. The corners are available earlier in gpu_apriltag.cc, while target_map.fbs currently has no corner fields. You could run the joint solver where the corners are available and provide it the field layout, or extend the message to carry tag IDs and corners so the solver can run where the field map and camera extrinsics are already used.
 
 Initialize the optimizer from the existing per-tag pose estimates, then verify it on recorded frames with ground-truth robot poses.
+### what optimizer may I use to minimize the reprojection error?
+I’d use Ceres Solver with a trust-region Levenberg–Marquardt optimizer. This repository already uses Ceres in target_mapper.cc.
 
+Create one 2D residual per observed tag corner:
+
+$$
+r_{ij} =
+\begin{bmatrix}s
+u_{\text{pred}}-u_{\text{observed}}\\
+v_{\text{pred}}-v_{\text{observed}}
+\end{bmatrix}
+$$
+
+Predict each corner’s pixel location from its known field position, the candidate robot pose, and the camera extrinsics/intrinsics. Minimize the sum of squared residuals, preferably with a Huber loss to limit the influence of misdetected or occluded corners.
+
+For a robot constrained to the floor, optimize just $(x,y,\text{yaw})$ and keep height, roll, and pitch fixed from calibration. Otherwise optimize a full 6-DoF pose using a rotation manifold rather than unconstrained Euler angles.
+
+Use either the original distorted pixels plus the camera distortion model, or undistorted pixels plus a pinhole model—don’t undistort and then apply distortion again. Seed the optimizer with the current best single-tag pose. The joint solver will also need the corner pixels, which aren’t currently included in TargetMap.
+
+
+### can I use othogonal iteration method here?
+Yes—in principle. Orthogonal iteration is a pose-from-points-and-rays method, so you can use it with corners from multiple tags if you express all the 3D corners in one shared field coordinate frame.
+
+For (K) tags, build (4K) correspondences:
+
+3D points: each tag’s four known local corners transformed into field coordinates using that tag’s field pose and size.
+Image rays: each observed corner converted to a normalized camera ray using the intrinsics, with distortion handled consistently.
+Then solve one field-to-camera pose for all the correspondences and convert it to a robot-to-field pose using the camera extrinsics.
+
+The existing code isn’t ready to do this directly: estimate_tag_pose_orthogonal_iteration constructs exactly four corners for one tag. The lower-level orthogonal_iteration accepts n_points, but its error calculation is hard-coded to four points, so it needs generalizing and testing before using (4K) points.
+
+One caveat: this method minimizes an object-space ray error, rather than directly minimizing pixel reprojection error. It can provide a good shared-pose estimate, which you could then refine with a robust pixel-reprojection optimizer. Also, the current TargetMap carries per-tag poses but not corners; the corner pixels are available earlier in gpu_apriltag.cc, so they’d need to be passed to wherever the joint solve runs.
 
 # References
 [MultiTag Localization](https://docs.photonvision.org/en/latest/docs/apriltag-pipelines/multitag.html)
