@@ -76,6 +76,15 @@
   - [Misc](#misc)
   - [Node](#node)
   - [PhasedLoopHandler](#phasedloophandler)
+  - [All Apps](#all-apps)
+    - [Standard FRC robot](#standard-frc-robot)
+    - [In this repository](#in-this-repository)
+    - [apriltag\_detector.cc (third\_party/aos/frc/vision/apriltag\_detector.cc)](#apriltag_detectorcc-third_partyaosfrcvisionapriltag_detectorcc)
+    - [localizer\_main.cc (third\_party/aos/frc/vision/swerve\_localizer/localizer\_main.cc)](#localizer_maincc-third_partyaosfrcvisionswerve_localizerlocalizer_maincc)
+    - [network\_tables\_publisher.cc](#network_tables_publishercc)
+    - [network\_tables\_server.cc](#network_tables_servercc)
+    - [network\_tables\_client.cc](#network_tables_clientcc)
+- [Event Loop](#event-loop)
 
 ## Pneumatics
 
@@ -659,7 +668,158 @@ The callback receives the number of cycles elapsed since its previous call. If t
 
 
 ## All Apps
-### apriltag_detector.cc
+The apps on an FRC robot depend on which controller and processor it uses.
+
+### Standard FRC robot
+* Robot code: Java, C++, or Python, running on the roboRIO; controls motors and mechanisms.
+* WPILib HAL/runtime: low-level libraries that let robot code access motors, sensors, CAN, and RIO I/O.
+* Robot radio firmware: runs on the radio, not on the main controller.
+* Motor-controller firmware: runs inside Talons, SPARKs, and other devices.
+
+The FRC Driver Station and dashboards such as Elastic or Foxglove generally run on the team laptop, not directly on the robot.
+
+### In this repository
+The RIO currently launches AOS processes from robot.json:
+
+* wpilib_interface: talks to WPILib hardware and motor-controller APIs (wpilib_interface.cc)
+* drivetrain: runs the swerve drivetrain control loop (drivetrain_main.cc)
+* joystick_reader: handles joystick input (joystick_reader.cc)
+* foxglove_websocket: exposes data for visualization (foxglove_websocket.cc)
+* starterd: manages and restarts those applications
+
+Vision applications, such as AprilTag detection, localizing, and aiming (aimer.cc and aimer_forwarder.cc), run on NVIDIA Jetson Orin coprocessors when installed. Their configuration is in 2026/vision/.
+
+### apriltag_detector.cc (third_party/aos/frc/vision/apriltag_detector.cc)
 get camera id, create AprilTagDetector (third_party/aos/frc/orin/gpu_apritag.cc) instance
 
-core function ApriltagDetector::HandleImage - detection tag, pose estimation (estimate_tag_pose_orthogonal_iteration) - to be continued
+core function ApriltagDetector::HandleImage - detection tag, pose estimation (estimate_tag_pose_orthogonal_iteration) - estimate the pose of the tag in the camera coordinate system.
+
+apriltag_detector.cc runs the AprilTag detector for one camera. In the current Orin config, four copies run—one for each camera.
+
+Each copy reads grayscale images from its configured channel, such as /camera0/gray, and uses that camera’s calibration to detect tags and estimate each tag’s position and orientation relative to the camera. It publishes the detections as a TargetMap and sends image annotations that can be used to visualize detected tag corners.
+
+It doesn’t compute the robot’s field position itself. The localizer_main app consumes vision detections along with robot motion data to estimate that pose.
+
+### localizer_main.cc (third_party/aos/frc/vision/swerve_localizer/localizer_main.cc)
+
+localizer_main application, running on the NVIDIA Jetson Orin coprocessor.
+
+It is listed in single_node_camera_config.json. It:
+
+* Receives AprilTag detections from the vision applications
+* Receives drivetrain odometry and speed data
+* Combines those inputs to estimate the robot’s field position (x, y, θ)
+* Publishes pose data to /localizer and /drivetrain
+  
+It does not run on the roboRIO. The repo’s robot.json only lists RIO applications: wpilib_interface, drivetrain, joystick_reader, and foxglove_websocket.
+
+However, in the current offseason code, the RIO side is incomplete for sending odometry to the Orin, so the localizer may not operate as a complete RIO-to-Orin pipeline until that communication is implemented.
+
+### network_tables_publisher.cc 
+It bridges AOS vision/localizer data to NetworkTables, so other robot tools or code can read it.
+
+It runs on the Orin, as configured in single_node_camera_config.json, and connects to the server named roborio by default. It publishes these values under the NetworkTables table orin:
+
+* apriltag_pose: estimates robot pose from the nearest AprilTag detection within the configured maximum distance, using the camera calibration and field map.
+* fused_pose: forwards the fused pose from the /localizer channel.
+* cam0_has_detections: indicates whether camera 0 has had a recent detection.
+
+So this is a publisher/bridge, not the localizer itself; localizer_main computes the fused pose.
+
+The critical function is void HandleTargetMap.
+
+
+### network_tables_server.cc 
+It starts a NetworkTables server using ntcore’s default settings. Other NetworkTables clients can connect to it; the file itself doesn’t publish robot data.
+
+It also prints NetworkTables log messages to standard error. The loop that sleeps once per second simply keeps the process alive while ntcore handles network activity in its own threads.
+
+The binary is defined as a Bazel target, but it is not listed as a running application in the current Orin config, single_node_camera_config.json. That config runs network_tables_publisher instead, which connects as a client to the roborio server.
+
+### network_tables_client.cc 
+It is a command-line debugging tool for connecting to a NetworkTables server, not a robot app that continuously runs as part of the current vision config.
+
+By default, it connects to 127.0.0.1. Its flags let you:
+
+* --topics: list available topics and their types.
+* --topic=...: read a double[] topic, or—with --type=struct:ChassisSpeeds—print incoming chassis-speed values.
+* --float_topic=...: read a float topic, then publish --float_val to it.
+
+It waits briefly for the connection and reports an error if it can’t connect. The current Orin config doesn’t list it as a running application.
+
+# Event Loop
+An AOS event loop is started with event_loop.Run(). It then waits and dispatches three kinds of work:
+
+1. Channel events: MakeWatcher
+A watcher runs a callback whenever a matching AOS message arrives:
+```
+event_loop->MakeWatcher("/localizer", callback);
+```
+
+Examples:
+
+* AprilTag detections trigger Localizer::HandleTarget.
+* /drivetrain speed messages trigger localizer updates in localizer.cc.
+* Grayscale camera images trigger TurboJpegDecoder::ProcessImage in turbojpeg_decoder.cc.
+* /drivetrain position messages trigger the drivetrain control loop in control_loop.h.
+
+Messages are delivered through shared memory between processes. The sending application, such as wpilib_interface, only sends the message; the receiving event loop invokes the registered callback.
+
+2. Periodic timers: AddTimer
+Timers invoke callbacks at a requested time or repeated interval:
+```
+aos::TimerHandler *timer = event_loop->AddTimer(callback);
+timer->Schedule(now, period);
+```
+Used for:
+
+* Publishing status every second.
+* Updating hardware or NetworkTables values periodically.
+* Polling hardware at a fixed rate.
+
+For example, a timed callback schedules status publication in turbojpeg_decoder.cc.
+
+3. Fixed-rate phased loops: AddPhasedLoop
+This runs a callback approximately in phase with a fixed period:
+```
+event_loop->AddPhasedLoop(callback, 20ms);
+```
+The localizer uses this to publish its EKF output every 20 ms in localizer.cc.
+
+4. Startup callbacks: OnRun
+OnRun() registers work that executes once the event loop has started.
+
+It is commonly used to:
+
+* Initialize state.
+* Reset an EKF.
+* Schedule timers.
+* Read an initial value.
+* Start hardware polling.
+
+For example, drivetrain_main.cc constructs a drivetrain object and calls event_loop.Run(). The control loop’s watcher then waits for /drivetrain position messages.
+
+When a position arrives, ControlLoop::IteratePosition:
+
+* Fetches the latest goal and robot state.
+* Checks whether outputs are enabled.
+* Calls RunIteration(...).
+* Sends output and status messages.
+
+So, broadly:
+```
+Hardware or another process
+        |
+message, timer, or event
+        |
+AOS EventLoop::Run()
+        |
+Registered callback/watch/timer/phased loop
+        |
+Processing function
+        |
+Sender publishes a new AOS message
+        |
+Other processes receive it
+```
+
